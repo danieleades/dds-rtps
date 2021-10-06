@@ -1,8 +1,12 @@
-/// Interoperability test program for RustDDS library
+//! Interoperability test program for `RustDDS` library
+
+#![deny(clippy::all)]
+#![warn(clippy::pedantic)]
+
 use log::{debug, error, trace, LevelFilter};
 use log4rs::{
     append::console::ConsoleAppender,
-    config::{Appender, Root},
+    config::{Appender, Deserializers, Root},
     Config,
 };
 
@@ -18,9 +22,9 @@ use rustdds::dds::{
 };
 use serde::{Deserialize, Serialize};
 
-use clap::{App, Arg}; // command line argument processing 
+use clap::{App, Arg, ArgMatches}; // command line argument processing 
 
-use mio::*; // polling
+use mio::{Events, Poll, PollOpt, Ready, Token}; // polling
 use mio_extras::channel; // pollable channel
 
 use std::io;
@@ -53,9 +57,257 @@ const READER_READY: Token = Token(1);
 const READER_STATUS_READY: Token = Token(2);
 const WRITER_STATUS_READY: Token = Token(3);
 
+#[allow(clippy::too_many_lines)]
 fn main() {
+    set_up_logging();
+    let matches = get_matches();
+
+    // Process command line arguments
+    let topic_name = matches.value_of("topic").unwrap_or("Square");
+    let domain_id = matches
+        .value_of("domain_id")
+        .unwrap_or("0")
+        .parse::<u16>()
+        .unwrap_or(0);
+    let color = matches.value_of("color").unwrap_or("BLUE");
+
+    let domain_participant = DomainParticipant::new(domain_id)
+        .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {:?}", e));
+
+    let mut qos_b = QosPolicyBuilder::new()
+        .reliability(if matches.is_present("reliable") {
+            Reliability::Reliable {
+                max_blocking_time: DDSDuration::DURATION_ZERO,
+            }
+        } else {
+            Reliability::BestEffort
+        })
+        .durability(match matches.value_of("durability") {
+            Some("l") => Durability::TransientLocal,
+            Some("t") => Durability::Transient,
+            Some("p") => Durability::Persistent,
+            _ => Durability::Volatile,
+        })
+        .history(match matches.value_of("history_depth").map(str::parse) {
+            None | Some(Err(_)) => History::KeepAll,
+            Some(Ok(d)) => {
+                if d < 0 {
+                    History::KeepAll
+                } else {
+                    History::KeepLast { depth: d }
+                }
+            }
+        });
+    match matches.value_of("deadline") {
+        None => (),
+        Some(dl) => match dl.parse::<f64>() {
+            Ok(d) => qos_b = qos_b.deadline(Deadline(DDSDuration::from_frac_seconds(d))),
+            Err(e) => panic!("Expected numeric value for deadline. {:?}", e),
+        },
+    }
+
+    assert!(
+        !matches.is_present("partition"),
+        "QoS policy Partition is not yet implemented."
+    );
+    assert!(
+        !matches.is_present("interval"),
+        "QoS policy Time Based Filter is not yet implemented."
+    );
+    assert!(
+        !matches.is_present("ownership_strength"),
+        "QoS policy Ownership Strength is not yet implemented."
+    );
+
+    let qos = qos_b.build();
+
+    let topic = domain_participant
+        .create_topic(topic_name, "ShapeType", &qos, TopicKind::WithKey)
+        .unwrap_or_else(|e| panic!("create_topic failed: {:?}", e));
+    println!(
+        "Topic name is {}. Type is {}.",
+        topic.get_name(),
+        topic.get_type().name()
+    );
+
+    // Set Ctrl-C handler
+    let (stop_sender, stop_receiver) = channel::channel();
+    ctrlc::set_handler(move || {
+        stop_sender.send(()).unwrap_or(());
+        // ignore errors, as we are quitting anyway
+    })
+    .expect("Error setting Ctrl-C handler");
+    println!("Press Ctrl-C to quit.");
+
+    let poll = Poll::new().unwrap();
+    let mut events = Events::with_capacity(4);
+
+    poll.register(
+        &stop_receiver,
+        STOP_PROGRAM,
+        Ready::readable(),
+        PollOpt::edge(),
+    )
+    .unwrap();
+
+    let is_publisher = matches.is_present("publisher");
+    let is_subscriber = matches.is_present("subscriber");
+
+    let mut writer_opt = if is_publisher {
+        debug!("Publisher");
+        let publisher = domain_participant.create_publisher(&qos).unwrap();
+        let mut writer = publisher
+            .create_datawriter_CDR::<Shape>( topic.clone(), None) // None = get qos policy from publisher
+            .unwrap();
+        poll.register(
+            writer.as_status_evented(),
+            WRITER_STATUS_READY,
+            Ready::readable(),
+            PollOpt::edge(),
+        )
+        .unwrap();
+        Some(writer)
+    } else {
+        None
+    };
+
+    let mut reader_opt = if is_subscriber {
+        debug!("Subscriber");
+        let subscriber = domain_participant.create_subscriber(&qos).unwrap();
+        let mut reader = subscriber
+            .create_datareader_CDR::<Shape>(topic.clone(), Some(qos))
+            .unwrap();
+        poll.register(&reader, READER_READY, Ready::readable(), PollOpt::edge())
+            .unwrap();
+        poll.register(
+            reader.as_status_evented(),
+            READER_STATUS_READY,
+            Ready::readable(),
+            PollOpt::edge(),
+        )
+        .unwrap();
+        debug!("Created DataReader");
+        Some(reader)
+    } else {
+        None
+    };
+
+    let mut shape_sample = Shape {
+        color: color.to_string(),
+        x: 0,
+        y: 0,
+        shapesize: 21,
+    };
+    let mut random_gen = thread_rng();
+    // a bit complicated lottery to ensure we do not end up with zero velocity.
+    let mut x_vel = if random() {
+        random_gen.gen_range(1..5)
+    } else {
+        random_gen.gen_range(-5..-1)
+    };
+    let mut y_vel = if random() {
+        random_gen.gen_range(1..5)
+    } else {
+        random_gen.gen_range(-5..-1)
+    };
+
+    let mut last_write = Instant::now();
+
+    loop {
+        poll.poll(&mut events, Some(Duration::from_millis(200)))
+            .unwrap();
+        for event in &events {
+            match event.token() {
+                STOP_PROGRAM => {
+                    if stop_receiver.try_recv().is_ok() {
+                        println!("Done.");
+                        return;
+                    }
+                }
+                READER_READY => {
+                    match reader_opt {
+                        Some(ref mut reader) => {
+                            loop {
+                                trace!("DataReader triggered");
+                                match reader.take_next_sample() {
+                                    Ok(Some(sample)) => match sample.into_value() {
+                                        Ok(sample) => println!(
+                                            "{:10.10} {:10.10} {:3.3} {:3.3} [{}]",
+                                            topic.get_name(),
+                                            sample.color,
+                                            sample.x,
+                                            sample.y,
+                                            sample.shapesize,
+                                        ),
+                                        Err(key) => println!("Disposed key {:?}", key),
+                                    },
+                                    Ok(None) => break, // no more data
+                                    Err(e) => println!("DataReader error {:?}", e),
+                                } // match
+                            }
+                        }
+                        None => {
+                            error!("Where is my reader?");
+                        }
+                    }
+                }
+                READER_STATUS_READY => match reader_opt {
+                    Some(ref mut reader) => {
+                        while let Some(status) = reader.try_recv_status() {
+                            println!("DataReader status: {:?}", status);
+                        }
+                    }
+                    None => {
+                        error!("Where is my reader?");
+                    }
+                },
+
+                WRITER_STATUS_READY => match writer_opt {
+                    Some(ref mut writer) => {
+                        while let Some(status) = writer.try_recv_status() {
+                            println!("DataWriter status: {:?}", status);
+                        }
+                    }
+                    None => {
+                        error!("Where is my writer?");
+                    }
+                },
+                other_token => {
+                    println!("Polled event is {:?}. WTF?", other_token);
+                }
+            }
+        }
+
+        let r = move_shape(shape_sample, x_vel, y_vel);
+        shape_sample = r.0;
+        x_vel = r.1;
+        y_vel = r.2;
+
+        // write to DDS
+        trace!("Writing shape color {}", &color);
+        match writer_opt {
+            Some(ref mut writer) => {
+                let now = Instant::now();
+                if last_write + Duration::from_millis(200) < now {
+                    writer
+                        .write(shape_sample.clone(), None)
+                        .unwrap_or_else(|e| error!("DataWriter write failed: {:?}", e));
+                    last_write = now;
+                }
+            }
+            None => {
+                if is_publisher {
+                    error!("Where is my writer?");
+                } else { /* never mind */
+                }
+            }
+        }
+    } // loop
+}
+
+fn set_up_logging() {
     // initialize logging, preferably from config file
-    log4rs::init_file("logging-config.yaml", Default::default()).unwrap_or_else(|e| {
+    log4rs::init_file("logging-config.yaml", Deserializers::default()).unwrap_or_else(|e| {
         match e.downcast_ref::<io::Error>() {
             // Config file did not work. If it is a simple "No such file or directory", then
             // substitute some default config.
@@ -72,8 +324,10 @@ fn main() {
             other_error => panic!("Config problem: {:?}", other_error),
         }
     });
+}
 
-    let matches = App::new("RustDDS-interop")
+fn get_matches() -> ArgMatches<'static> {
+    App::new("RustDDS-interop")
         .version("0.2.2")
         .author("Juhana Helovuo <juhe@iki.fi>")
         .about("Command-line \"shapes\" interoperability test.")
@@ -166,254 +420,7 @@ fn main() {
                 .takes_value(true)
                 .value_name("strength"),
         )
-        .get_matches();
-
-    // Process command line arguments
-    let topic_name = matches.value_of("topic").unwrap_or("Square");
-    let domain_id = matches
-        .value_of("domain_id")
-        .unwrap_or("0")
-        .parse::<u16>()
-        .unwrap_or(0);
-    let color = matches.value_of("color").unwrap_or("BLUE");
-
-    let domain_participant = DomainParticipant::new(domain_id)
-        .unwrap_or_else(|e| panic!("DomainParticipant construction failed: {:?}", e));
-
-    let mut qos_b = QosPolicyBuilder::new()
-        .reliability(if matches.is_present("reliable") {
-            Reliability::Reliable {
-                max_blocking_time: DDSDuration::DURATION_ZERO,
-            }
-        } else {
-            Reliability::BestEffort
-        })
-        .durability(match matches.value_of("durability") {
-            Some("v") => Durability::Volatile,
-            Some("l") => Durability::TransientLocal,
-            Some("t") => Durability::Transient,
-            Some("p") => Durability::Persistent,
-            _ => Durability::Volatile,
-        })
-        .history(
-            match matches.value_of("history_depth").map(|d| d.parse::<i32>()) {
-                None | Some(Err(_)) => History::KeepAll,
-                Some(Ok(d)) => {
-                    if d < 0 {
-                        History::KeepAll
-                    } else {
-                        History::KeepLast { depth: d }
-                    }
-                }
-            },
-        );
-    match matches.value_of("deadline") {
-        None => (),
-        Some(dl) => match dl.parse::<f64>() {
-            Ok(d) => qos_b = qos_b.deadline(Deadline(DDSDuration::from_frac_seconds(d))),
-            Err(e) => panic!("Expected numeric value for deadline. {:?}", e),
-        },
-    }
-
-    if matches.is_present("partition") {
-        panic!("QoS policy Partition is not yet implemented.")
-    }
-
-    if matches.is_present("interval") {
-        panic!("QoS policy Time Based Filter is not yet implemented.")
-    }
-
-    if matches.is_present("ownership_strength") {
-        panic!("QoS policy Ownership Strength is not yet implemented.")
-    }
-
-    let qos = qos_b.build();
-
-    let topic = domain_participant
-        .create_topic(topic_name, "ShapeType", &qos, TopicKind::WithKey)
-        .unwrap_or_else(|e| panic!("create_topic failed: {:?}", e));
-    println!(
-        "Topic name is {}. Type is {}.",
-        topic.get_name(),
-        topic.get_type().name()
-    );
-
-    // Set Ctrl-C handler
-    let (stop_sender, stop_receiver) = channel::channel();
-    ctrlc::set_handler(move || {
-        stop_sender.send(()).unwrap_or(())
-        // ignore errors, as we are quitting anyway
-    })
-    .expect("Error setting Ctrl-C handler");
-    println!("Press Ctrl-C to quit.");
-
-    let poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(4);
-
-    poll.register(
-        &stop_receiver,
-        STOP_PROGRAM,
-        Ready::readable(),
-        PollOpt::edge(),
-    )
-    .unwrap();
-
-    let is_publisher = matches.is_present("publisher");
-    let is_subscriber = matches.is_present("subscriber");
-
-    let mut writer_opt = if is_publisher {
-        debug!("Publisher");
-        let publisher = domain_participant.create_publisher(&qos).unwrap();
-        let mut writer = publisher
-            .create_datawriter_CDR::<Shape>( topic.clone(), None) // None = get qos policy from publisher
-            .unwrap();
-        poll.register(
-            writer.as_status_evented(),
-            WRITER_STATUS_READY,
-            Ready::readable(),
-            PollOpt::edge(),
-        )
-        .unwrap();
-        Some(writer)
-    } else {
-        None
-    };
-
-    let mut reader_opt = if is_subscriber {
-        debug!("Subscriber");
-        let subscriber = domain_participant.create_subscriber(&qos).unwrap();
-        let mut reader = subscriber
-            .create_datareader_CDR::<Shape>(topic.clone(), Some(qos))
-            .unwrap();
-        poll.register(&reader, READER_READY, Ready::readable(), PollOpt::edge())
-            .unwrap();
-        poll.register(
-            reader.as_status_evented(),
-            READER_STATUS_READY,
-            Ready::readable(),
-            PollOpt::edge(),
-        )
-        .unwrap();
-        debug!("Created DataReader");
-        Some(reader)
-    } else {
-        None
-    };
-
-    let mut shape_sample = Shape {
-        color: color.to_string(),
-        x: 0,
-        y: 0,
-        shapesize: 21,
-    };
-    let mut random_gen = thread_rng();
-    // a bit complicated lottery to ensure we do not end up with zero velocity.
-    let mut x_vel = if random() {
-        random_gen.gen_range(1..5)
-    } else {
-        random_gen.gen_range(-5..-1)
-    };
-    let mut y_vel = if random() {
-        random_gen.gen_range(1..5)
-    } else {
-        random_gen.gen_range(-5..-1)
-    };
-
-    let mut last_write = Instant::now();
-
-    loop {
-        poll.poll(&mut events, Some(Duration::from_millis(200)))
-            .unwrap();
-        for event in &events {
-            match event.token() {
-                STOP_PROGRAM => {
-                    match stop_receiver.try_recv() {
-                        Ok(_) => {
-                            println!("Done.");
-                            return;
-                        }
-                        Err(_) => { /* Can this even happen? */ }
-                    }
-                }
-                READER_READY => {
-                    match reader_opt {
-                        Some(ref mut reader) => {
-                            loop {
-                                trace!("DataReader triggered");
-                                match reader.take_next_sample() {
-                                    Ok(Some(sample)) => match sample.into_value() {
-                                        Ok(sample) => println!(
-                                            "{:10.10} {:10.10} {:3.3} {:3.3} [{}]",
-                                            topic.get_name(),
-                                            sample.color,
-                                            sample.x,
-                                            sample.y,
-                                            sample.shapesize,
-                                        ),
-                                        Err(key) => println!("Disposed key {:?}", key),
-                                    },
-                                    Ok(None) => break, // no more data
-                                    Err(e) => println!("DataReader error {:?}", e),
-                                } // match
-                            }
-                        }
-                        None => {
-                            error!("Where is my reader?");
-                        }
-                    }
-                }
-                READER_STATUS_READY => match reader_opt {
-                    Some(ref mut reader) => {
-                        while let Some(status) = reader.try_recv_status() {
-                            println!("DataReader status: {:?}", status);
-                        }
-                    }
-                    None => {
-                        error!("Where is my reader?");
-                    }
-                },
-
-                WRITER_STATUS_READY => match writer_opt {
-                    Some(ref mut writer) => {
-                        while let Some(status) = writer.try_recv_status() {
-                            println!("DataWriter status: {:?}", status);
-                        }
-                    }
-                    None => {
-                        error!("Where is my writer?");
-                    }
-                },
-                other_token => {
-                    println!("Polled event is {:?}. WTF?", other_token);
-                }
-            }
-        }
-
-        let r = move_shape(shape_sample, x_vel, y_vel);
-        shape_sample = r.0;
-        x_vel = r.1;
-        y_vel = r.2;
-
-        // write to DDS
-        trace!("Writing shape color {}", &color);
-        match writer_opt {
-            Some(ref mut writer) => {
-                let now = Instant::now();
-                if last_write + Duration::from_millis(200) < now {
-                    writer
-                        .write(shape_sample.clone(), None)
-                        .unwrap_or_else(|e| error!("DataWriter write failed: {:?}", e));
-                    last_write = now;
-                }
-            }
-            None => {
-                if is_publisher {
-                    error!("Where is my writer?");
-                } else { /* never mind */
-                }
-            }
-        }
-    } // loop
+        .get_matches()
 }
 
 fn move_shape(shape: Shape, xv: i32, yv: i32) -> (Shape, i32, i32) {
